@@ -1,6 +1,7 @@
   if (typeof fc_cfg === "undefined") { fc_cfg = window.fc_cfg || {}; }
+
     // Get current user's timezone offset safely
-const offsetMinutes = new Date().getTimezoneOffset();
+const fc_offsetMinutes = new Date().getTimezoneOffset();
 
 // Convert to ±HH:MM format
 function fc_formatOffset_fnc(mins) {
@@ -11,9 +12,8 @@ function fc_formatOffset_fnc(mins) {
   return `${sign}${hours}:${minutes}`;
 }
 
-let fc_offset = fc_formatOffset_fnc(offsetMinutes);
+let fc_offset = fc_formatOffset_fnc(fc_offsetMinutes);
 
-        let fc_eventSource = null; 
         let fc_initialized = false; 
         fc_base_url = 'https://widgets.fishingcab.com/Widgets/';
         fc_cdn_url = 'https://cdn-widgets.fishingcab.com/';
@@ -41,6 +41,8 @@ let fc_offset = fc_formatOffset_fnc(offsetMinutes);
         }
 
        
+
+       
 function fc_safeText_fnc(text) {
   const span = document.createElement("span");
   span.textContent = text ?? "";
@@ -59,6 +61,20 @@ function fc_el_fnc(tag, className, attrs = {}) {
 
 const fc_qs_fnc = (sel, root = document) => root.querySelector(sel);
 const fc_qsa_fnc = (sel, root = document) => root.querySelectorAll(sel);
+
+function fc_retry_lookup_fnc(store, missing, id, max = 3) {
+  if (store[id]) {
+    delete missing[id];
+    return store[id];
+  }
+  missing[id] = (missing[id] || 0) + 1;
+  if (missing[id] >= max) {
+    delete store[id];
+    delete missing[id];
+  }
+  return null;
+}
+
 
 const fc_removeElement_fnc = (fc_el, fc_duration = 300) => {
   if (!(fc_el instanceof Element)) return; // ensure it's a DOM element
@@ -454,9 +470,23 @@ function fc_contentNotification_fnc(fc_notification, fc_user_public_key, fc_user
         return "";
       }
       delete fc_missingUsers[fc_notification.parent_id];
-      return `<a href="javascript:void(0)" onclick="fc_view_profile_fnc('Profile', '${fc_userValue.user_id}', false, false, '${fc_user_public_key}', '${fc_user_secret_key}')">${fc_userValue.nickname}</a> sent you a chat request.`;
-    }
+        // Decide link type
+        let linkType = "Profile";
+        let showRequest = false;
 
+        if (fc_userValue.blocked === 0 && fc_userValue.chat_request === 1) {
+          linkType = "Chat Request";
+          showRequest = true;
+        }
+
+        return `
+          <a href="javascript:void(0)" 
+            onclick="fc_view_profile_fnc('${linkType}', '${fc_userValue.user_id}', false, ${showRequest}, '${fc_user_public_key}', '${fc_user_secret_key}')">
+            ${fc_userValue.nickname}
+          </a> sent you a chat request.
+        `;
+    }
+          
     case "accept_chat_request": {
       const fc_userValue = fc_push_users?.[fc_notification.parent_id];
       if (!fc_userValue) {
@@ -598,7 +628,7 @@ async function fc_push_fnc(fc_push, fc_user_public_key, fc_user_secret_key) {
 
           if (fc_missingUsers[fc_push.parent_id] >= 3) {
             // Still missing on second call → delete
-            delete fc_push_Users[fc_push.parent_id];
+            delete fc_push_users[fc_push.parent_id];
             delete fc_missingUsers[fc_push.parent_id]; // cleanup counter
             return true;
           }
@@ -631,7 +661,7 @@ async function fc_push_fnc(fc_push, fc_user_public_key, fc_user_secret_key) {
 
           if (fc_missingUsers[fc_push.parent_id] >= 3) {
             // Still missing on second call → delete
-            delete fc_push_Users[fc_push.parent_id];
+            delete fc_push_users[fc_push.parent_id];
             delete fc_missingUsers[fc_push.parent_id]; // cleanup counter
             return true;
           }
@@ -773,6 +803,17 @@ async function fc_push_fnc(fc_push, fc_user_public_key, fc_user_secret_key) {
 
       return true; // success
     }
+    case "notification_remove": {
+
+      const notifSelector = `#fc-notification-${fc_push.parent_id}`;
+
+      const notifEl = fc_qs_fnc(notifSelector);
+      if (notifEl) {
+        fc_removeElement_fnc(notifEl, 300);
+      }
+
+      return true; // success
+    }
 
         case "messages_remove": {
 
@@ -832,8 +873,6 @@ async function fc_push_fnc(fc_push, fc_user_public_key, fc_user_secret_key) {
       
       }
 }
-
-
 
 
 function fc_ensureMessengerStyles_fnc() {
@@ -2628,29 +2667,136 @@ function fc_token_fnc(length, chars = 'aA#') {
    =============================== */
 window.fc_priorityLock = false;            // TRUE = fc_realTime_fnc running
 window.fc_pushLock = false;                // TRUE = fc_processPush_fnc running
-window.fc_eventSource = null;              // current EventSource instance
-window.fc_eventSourceActive = false;       // TRUE = SSE is open
 window.fc_streamBackoff = 1000;            // reconnect delay (ms)
 window.fc_streamBackoffMax = 15000;        // max backoff (ms)
 window.fc_last_user_public = null;         // last user public key
 window.fc_last_user_secret = null;         // last user secret key
 
-/* ===============================
-   LIGHT HELPERS
-   =============================== */
-function fc_resetBackoff() {
+window.fc_ws = null;
+window.fc_wsActive = false;
+window.fc_wsConnecting = false;
+window.fc_wsReconnectTimer = null;
+window.fc_heartbeatTimer = null;
+
+function fc_resetBackoff_fnc() {
   window.fc_streamBackoff = 1000;
 }
-function fc_increaseBackoff() {
-  window.fc_streamBackoff = Math.min(window.fc_streamBackoff * 2, window.fc_streamBackoffMax);
+
+function fc_increaseBackoff_fnc() {
+  window.fc_streamBackoff = Math.min(
+    window.fc_streamBackoff * 2,
+    window.fc_streamBackoffMax
+  );
 }
-function fc_safeCloseSSE() {
-  if (window.fc_eventSource) {
-    try { window.fc_eventSource.close(); } catch (_) {}
+
+function fc_safeCloseWS_fnc() {
+  try {
+    if (window.fc_ws) {
+      window.fc_ws.onopen =
+      window.fc_ws.onmessage =
+      window.fc_ws.onerror =
+      window.fc_ws.onclose = null;
+      window.fc_ws.close();
+    }
+  } catch (_) {}
+
+  window.fc_ws = null;
+  window.fc_wsActive = false;
+  window.fc_wsConnecting = false;
+
+  if (window.fc_heartbeatTimer) {
+    clearInterval(window.fc_heartbeatTimer);
+    window.fc_heartbeatTimer = null;
   }
-  window.fc_eventSource = null;
-  window.fc_eventSourceActive = false;
 }
+
+
+function fc_openWS_fnc(fc_user_public_key, fc_user_secret_key) {
+  if (window.fc_wsActive || window.fc_wsConnecting) return;
+
+  window.fc_wsConnecting = true;
+
+  fc_safeCloseWS_fnc();
+
+  const socket = new WebSocket("wss://ws.fishingcab.com");
+  window.fc_ws = socket;
+
+  // HEARTBEAT (SINGLE INSTANCE)
+  const startHeartbeat = () => {
+    if (window.fc_heartbeatTimer) return;
+
+    window.fc_heartbeatTimer = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "ping" }));
+      }
+    }, 30000);
+  };
+
+  const stopHeartbeat = () => {
+    if (window.fc_heartbeatTimer) {
+      clearInterval(window.fc_heartbeatTimer);
+      window.fc_heartbeatTimer = null;
+    }
+  };
+
+  socket.onopen = () => {
+    window.fc_wsActive = true;
+    window.fc_wsConnecting = false;
+    fc_resetBackoff_fnc();
+
+    socket.send(JSON.stringify({ user_id: fc_user_id }));
+
+    startHeartbeat();
+
+    if (!document.hidden) {
+      document.querySelectorAll("[id^='fc-chat-win-']").forEach(el => {
+        const id = el.id.replace("fc-chat-win-", "");
+        setTimeout(() => {
+          fc_try_auto_tmp_fnc(id, fc_user_public_key, fc_user_secret_key);
+        }, 800);
+      });
+    }
+
+    fc_processPush_fnc(fc_user_public_key, fc_user_secret_key);
+  };
+
+  socket.onmessage = (event) => {
+    let data;
+    try { data = JSON.parse(event.data); }
+    catch { return; }
+
+    if (data.type === "pong") return;
+
+    if (data.event === "update") {
+      if (!window.fc_priorityLock) {
+        fc_realTime_fnc("stream", fc_user_public_key, fc_user_secret_key);
+      }
+    }
+  };
+
+  socket.onerror = () => {
+    socket.close();
+  };
+
+  socket.onclose = () => {
+    stopHeartbeat();
+    window.fc_wsActive = false;
+    window.fc_wsConnecting = false;
+
+    if (document.hidden) return;
+
+    if (!window.fc_wsReconnectTimer) {
+      window.fc_wsReconnectTimer = setTimeout(() => {
+        window.fc_wsReconnectTimer = null;
+        fc_increaseBackoff_fnc();
+        fc_openWS_fnc(fc_user_public_key, fc_user_secret_key);
+      }, window.fc_streamBackoff);
+    }
+  };
+}
+
+
+
 
 /* ===============================
    HIGH PRIORITY REALTIME FUNCTION
@@ -2663,95 +2809,87 @@ async function fc_realTime_fnc(
   fc_data = "",
   fc_callback = null
 ) {
-  if (!window.fc_cfg || !window.fc_cfg.widget_id) return false;
+  // --- Validation ---
+  if (!window.fc_cfg?.widget_id) {
+    return false;
+  }
+  if (!fc_action || !fc_user_public_key || !fc_user_secret_key) {
+    return false;
+  }
 
-  // Prevent duplicates
-  if (window.fc_priorityLock) return false;
+  // --- Prevent duplicate runs ---
+  if (window.fc_priorityLock) {
+    return false;
+  }
   window.fc_priorityLock = true;
 
-  // Pause SSE immediately
-  fc_safeCloseSSE();
+  // --- Reset backoff before starting ---
+ // fc_resetBackoff();
 
-  // Process any pending pushes first
-   await fc_processPush_fnc(fc_user_public_key, fc_user_secret_key);
+  // --- Process pending pushes first ---
+  try {
+    await fc_processPush_fnc(fc_user_public_key, fc_user_secret_key);
+  } catch (err) {
+  }
 
   try {
-    let fc_url = `${fc_base_url}chat/${encodeURIComponent(window.fc_cfg.widget_id)}`;
+    // --- URL selection ---
+    const actionMap = {
+      conversation: "conversation",
+      profile_update: "profile_update",
+      location_update: "location_update"
+    };
+    let fc_url = `${fc_base_url}${actionMap[fc_action] || "chat"}/${encodeURIComponent(window.fc_cfg.widget_id)}`;
 
-if (fc_action === "conversation") {
-  fc_url = `${fc_base_url}conversation/${encodeURIComponent(window.fc_cfg.widget_id)}`;
-}
-
-if (fc_action === "profile_update") {
-  fc_url = `${fc_base_url}profile_update/${encodeURIComponent(window.fc_cfg.widget_id)}`;
-}
-
-if (fc_action === "location_update") {
-  fc_url = `${fc_base_url}location_update/${encodeURIComponent(window.fc_cfg.widget_id)}`;
-}
-    
     const fc_timeout = 9000;
     const fc_max_retries = 3;
 
-    let fc_body;
+    // --- Headers ---
     const fc_headers = {
       "X-Requested-With": "XMLHttpRequest",
       "Accept": "application/json"
     };
 
-   // FILE UPLOAD
-if (fc_action === "send_file" && fc_data instanceof FormData) {
-  fc_data.append("do", fc_action);
-  fc_data.append("user_public_key", fc_user_public_key);
-  fc_data.append("user_secret_key", fc_user_secret_key);
-  fc_data.append("id", fc_id);
-  fc_data.append("offset", fc_offset);
-  fc_data.append("latitude", fc_latitude);
-  fc_data.append("longitude", fc_longitude);
-  fc_data.append("token", fc_token_fnc(8));
+    // --- Body construction ---
+    let fc_body;
+    switch (fc_action) {
+      case "send_file":
+        if (!(fc_data instanceof FormData)) {
+          return false;
+        }
+        fc_data.append("do", fc_action);
+        fc_data.append("user_public_key", fc_user_public_key);
+        fc_data.append("user_secret_key", fc_user_secret_key);
+        fc_data.append("id", fc_id);
+        fc_data.append("offset", fc_offset);
+        fc_data.append("latitude", fc_latitude);
+        fc_data.append("longitude", fc_longitude);
+        fc_data.append("token", fc_token_fnc(8));
 
-  const fileInput = document.getElementById(`fc-file-${fc_id}`);
-  if (fileInput?.files?.[0]) {
-    fc_data.append("data", fileInput.files[0]); // backend-compatible
-  }
+        const fileInput = document.getElementById(`fc-file-${fc_id}`);
+        if (fileInput?.files?.[0]) {
+          fc_data.append("data", fileInput.files[0]);
+        }
+        fc_body = fc_data; // FormData → no content-type header
+        break;
 
-  fc_body = fc_data; // FormData → no content-type header
-}
+      case "conversation":
+        fc_body = `conversation_id=${encodeURIComponent(fc_id)}&user_id=${encodeURIComponent(fc_data)}`;
+        fc_headers["Content-Type"] = "application/x-www-form-urlencoded";
+        break;
 
-// CONVERSATION
-else if (fc_action === "conversation") {
-  fc_body =
-    `conversation_id=${encodeURIComponent(fc_id)}` +
-    `&user_id=${encodeURIComponent(fc_data)}`;
+      case "profile_update":
+      case "location_update":
+        fc_body = `user_public_key=${encodeURIComponent(fc_user_public_key)}&user_secret_key=${encodeURIComponent(fc_user_secret_key)}&data=${encodeURIComponent(JSON.stringify(fc_data))}`;
+        fc_headers["Content-Type"] = "application/x-www-form-urlencoded";
+        break;
 
-  fc_headers["Content-Type"] = "application/x-www-form-urlencoded";
-}
+      default:
+        fc_body = `do=${encodeURIComponent(fc_action)}&user_public_key=${encodeURIComponent(fc_user_public_key)}&user_secret_key=${encodeURIComponent(fc_user_secret_key)}&id=${encodeURIComponent(fc_id)}&data=${encodeURIComponent(fc_data)}&offset=${fc_offset}&latitude=${fc_latitude}&longitude=${fc_longitude}&token=${fc_token_fnc(8)}`;
+        fc_headers["Content-Type"] = "application/x-www-form-urlencoded";
+    }
 
-// PROFILE/LOCATION UPDATE (FIXED)
-else if (fc_action === "profile_update" || fc_action === "location_update") {
-  fc_body =
-    `user_public_key=${encodeURIComponent(fc_user_public_key)}` +
-    `&user_secret_key=${encodeURIComponent(fc_user_secret_key)}` +
-    `&data=${encodeURIComponent(JSON.stringify(fc_data))}`;
-
-  fc_headers["Content-Type"] = "application/x-www-form-urlencoded";
-}
-
-// DEFAULT ACTIONS
-else {
-  fc_body =
-    `do=${encodeURIComponent(fc_action)}` +
-    `&user_public_key=${encodeURIComponent(fc_user_public_key)}` +
-    `&user_secret_key=${encodeURIComponent(fc_user_secret_key)}` +
-    `&id=${encodeURIComponent(fc_id)}` +
-    `&data=${encodeURIComponent(fc_data)}` +
-    `&offset=${fc_offset}&latitude=${fc_latitude}&longitude=${fc_longitude}` +
-    `&token=${fc_token_fnc(8)}`;
-
-  fc_headers["Content-Type"] = "application/x-www-form-urlencoded";
-}
-
-    // Fetch with timeout (lightest)
+    // --- Fetch with timeout ---
     const fetchWithTimeout = (url, options, timeout) => {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), timeout);
@@ -2759,18 +2897,14 @@ else {
         .finally(() => clearTimeout(t));
     };
 
+    // --- Retry loop with backoff ---
     let attempt = 0;
     while (attempt <= fc_max_retries) {
       try {
-        const res = await fetchWithTimeout(
-          fc_url,
-          { method: "POST", headers: fc_headers, body: fc_body },
-          fc_timeout
-        );
-        if (!res.ok) throw 1;
+        const res = await fetchWithTimeout(fc_url, { method: "POST", headers: fc_headers, body: fc_body }, fc_timeout);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
         const json = await res.json();
-
         if (typeof fc_doUpdates_fnc === "function") {
           fc_doUpdates_fnc(json, fc_action, fc_user_public_key, fc_user_secret_key);
         }
@@ -2779,9 +2913,9 @@ else {
         }
 
         return true;
-      } catch (_) {
+      } catch (err) {
         if (attempt >= fc_max_retries) return false;
-        await new Promise(r => setTimeout(r, 600));
+        await new Promise(r => setTimeout(r, 600 * (attempt + 1))); // exponential backoff
       }
       attempt++;
     }
@@ -2789,21 +2923,17 @@ else {
     return false;
 
   } finally {
-    // Release priority and resume SSE once
+    // --- Release lock and resume updates ---
     window.fc_priorityLock = false;
 
-    if (window.fc_last_user_public && typeof fc_getUpdates_fnc === "function" && !window.fc_eventSourceActive) {
+    if (fc_user_secret_key && typeof fc_getUpdates_fnc === "function" && !window.fc_wsActive) {
       setTimeout(() => {
-        fc_getUpdates_fnc(
-          "initialize",
-          window.fc_cfg,
-          window.fc_last_user_public,
-          window.fc_last_user_secret
-        );
+        fc_getUpdates_fnc("initialize", window.fc_cfg, fc_user_public_key, fc_user_secret_key);
       }, 600);
     }
   }
 }
+
 
 
 async function fc_processPush_fnc(fc_user_public_key, fc_user_secret_key) {
@@ -2835,96 +2965,22 @@ async function fc_processPush_fnc(fc_user_public_key, fc_user_secret_key) {
 
 
 /* ===============================
-   LOW PRIORITY SSE FUNCTION
+   LOW PRIORITY REALTIME (WebSocket)
    =============================== */
-function fc_getUpdates_fnc(
-  fc_action,
-  fc_cfg_rev,
-  fc_user_public_key,
-  fc_user_secret_key
-) {
-  // Only initialize SSE
+function fc_getUpdates_fnc(fc_action, fc_cfg_rev, fc_user_public_key, fc_user_secret_key) {
   if (fc_action !== "initialize") return;
-  if (!fc_cfg_rev || !fc_cfg_rev.widget_id) return;
+  if (!fc_cfg_rev?.widget_id || !fc_user_id) return;
 
-  // Update globals
   window.fc_cfg = fc_cfg_rev;
   window.fc_last_user_public = fc_user_public_key;
   window.fc_last_user_secret = fc_user_secret_key;
 
-  // Do not start SSE if realtime is running or SSE already active
-  if (window.fc_priorityLock || window.fc_eventSourceActive) return;
+  if (window.fc_priorityLock) return;
 
-  const fc_openSSE_fnc = async () => {
-
-    if (!document.hidden) {
-    document.querySelectorAll("[id^='fc-chat-win-']").forEach(chatWinEl => {
-      const fc_chatId = chatWinEl.id.replace("fc-chat-win-", "");
-      setTimeout(() => {
-  fc_try_auto_tmp_fnc(fc_chatId, fc_user_public_key, fc_user_secret_key);
-      }, 1000);
-    });
-  }
-
-    // Process any pending pushes first
-   await fc_processPush_fnc(fc_user_public_key, fc_user_secret_key);
-
-    if (window.fc_priorityLock) return;
-
-    // Close any stale instance
-    fc_safeCloseSSE();
-
-    // Open new SSE
-    try {
-      window.fc_eventSource = new EventSource(
-        `${fc_base_url}stream_sse/${window.fc_cfg.widget_id}` +
-        `?user_public_key=${encodeURIComponent(fc_user_public_key)}` +
-        `&user_secret_key=${encodeURIComponent(fc_user_secret_key)}`
-      );
-      window.fc_eventSourceActive = true;
-      fc_resetBackoff(); // reset backoff on successful open
-    } catch (_) {
-      return fc_scheduleReconnect_fnc();
-    }
-
-    // Process stream (locked, pause SSE → run realtime → resume)
-    const fc_processStream_fnc = async () => {
-      if (window.fc_priorityLock) return;
-      fc_safeCloseSSE();
-      await fc_realTime_fnc("stream", fc_user_public_key, fc_user_secret_key);
-      // realtime will resume SSE via its finally block
-    };
-
-    // Push count event
-    window.fc_eventSource.addEventListener("push_count", (e) => {
-      const count = Number(e.data) || 0;
-      if (count > 0) fc_processStream_fnc();
-    });
-
-    // Heartbeat (no work)
-    window.fc_eventSource.addEventListener("heartbeat", () => {});
-
-    // Clean end
-    window.fc_eventSource.addEventListener("end", () => {
-      fc_safeCloseSSE();
-      fc_scheduleReconnect_fnc();
-    });
-
-    // Error → backoff reconnect
-    window.fc_eventSource.onerror = () => {
-      fc_safeCloseSSE();
-      fc_scheduleReconnect_fnc();
-    };
-  };
-
-  const fc_scheduleReconnect_fnc = () => {
-    if (window.fc_priorityLock || window.fc_eventSourceActive) return;
-    setTimeout(fc_openSSE_fnc, window.fc_streamBackoff);
-    fc_increaseBackoff();
-  };
-
-  fc_openSSE_fnc();
+  fc_openWS_fnc(fc_user_public_key, fc_user_secret_key);
 }
+
+
 
 
 async function fc_delete_messages_fnc(fc_chat_id, fc_user_public_key, fc_user_secret_key) {
@@ -4386,21 +4442,22 @@ function fc_sound_fnc(fc_type = "notification", fc_zone = '') {
 // =======================
 // Message Status Function
 // =======================
-function fc_message_status_fnc(fc_message) {
+function fc_message_status_fnc(fc_message, fc_retries = 0) {
   if (!fc_cfg || !fc_cfg.widget_id) return;
   if (!fc_message || !fc_message.message_id || !fc_message.chat_id) return;
 
   const statusEl = fc_qs_fnc(`#fc-message-status-${fc_message.message_id}`);
-  
+
   if (!statusEl) {
-    // If element not yet in DOM, retry after next frame
-    requestAnimationFrame(() => fc_message_status_fnc(fc_message));
+    if (fc_retries < 5) {
+      requestAnimationFrame(() => fc_message_status_fnc(fc_message, fc_retries + 1));
+    } 
     return;
   }
 
   const isSender = fc_message.user_id === fc_user_id;
 
- const icons = {
+ const FC_ICONS = Object.freeze({
         sending: `
           <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
             <path d="M8 3.5a.5.5 0 0 1 .5.5v4l2.5 1.5a.5.5 0 0 1-.5.866l-3-1.8A.5.5 0 0 1 7.5 8V4a.5.5 0 0 1 .5-.5z"/>
@@ -4427,7 +4484,7 @@ function fc_message_status_fnc(fc_message) {
             <path d="M7.002 11h2V7h-2v4zm0-6h2V3h-2v2z"/>
           </svg>
         `
-    };
+    });
 
   statusEl.classList.remove(`fc-seen-${fc_cfg.widget_id}`);
 
@@ -4435,13 +4492,13 @@ function fc_message_status_fnc(fc_message) {
 
   if (isSender) {
     switch (fc_message_status) {
-      case 1: statusEl.innerHTML = icons.sent; break;
-      case 2: statusEl.innerHTML = icons.delivered; break;
-      case 3: statusEl.innerHTML = icons.seen; statusEl.classList.add(`fc-seen-${fc_cfg.widget_id}`); break;
-      default: statusEl.innerHTML = icons.sending;
+      case 1: statusEl.innerHTML = FC_ICONS.sent; break;
+      case 2: statusEl.innerHTML = FC_ICONS.delivered; break;
+      case 3: statusEl.innerHTML = FC_ICONS.seen; statusEl.classList.add(`fc-seen-${fc_cfg.widget_id}`); break;
+      default: statusEl.innerHTML = FC_ICONS.sending;
     }
   } else {
-    statusEl.innerHTML = icons.info;
+    statusEl.innerHTML = FC_ICONS.info;
   }
 
 
@@ -4758,75 +4815,91 @@ async function fc_send_tmp_fnc(fc_recordId, fc_recordType, fc_user_public_key, f
   const tmpData = JSON.stringify({
     type: fc_recordType,
     id: fc_recordId,
-    time: Math.floor(Date.now() / 1000) // UNIX timestamp in seconds
+    time: Math.floor(Date.now() / 1000)
   });
 
-  // Per-tmp lock to prevent double sending
   const fc_lockKey = `fc_${fc_recordType}_lock_${fc_chat_id}_${fc_recordId}`;
   if (window[fc_lockKey]) return;
   window[fc_lockKey] = true;
+
   try {
-    await fc_realTime_fnc(
-      "tmp",
-      fc_user_public_key,
-      fc_user_secret_key,
-      fc_chat_id,
-      tmpData,
-      async function(response) {
-  if (response && response.status) {
-    // Remove only once successfully acknowledged
-    if (fc_recordType === "read") {
-      const fc_unseenSet = window.fc_unread_messages.get(fc_chat_id);
-      if (fc_unseenSet) {
-        fc_unseenSet.delete(fc_recordId);
-        fc_update_seen_badge_fnc(fc_chat_id);
+    await fc_realTime_fnc("tmp", fc_user_public_key, fc_user_secret_key, fc_chat_id, tmpData, async function(response) {
+      if (response && response.status) {
+        if (fc_recordType === "read") {
+          const fc_unseenSet = window.fc_unread_messages.get(fc_chat_id);
+          if (fc_unseenSet) {
+            fc_unseenSet.delete(fc_recordId);
+            fc_update_seen_badge_fnc(fc_chat_id);
+          }
+        }
+        if (fc_recordType === "seen") {
+          const fc_unseenCount = Number(window.fc_unseen_notifications) || 0;
+          window.fc_unseen_notifications = Math.max(fc_unseenCount - 1, 0);
+          fc_countNotification_fnc(fc_user_public_key, fc_user_secret_key);
+          const notif = document.getElementById(`fc-notification-${fc_recordId}`);
+          if (notif) notif.classList.remove(`fc-unread-${fc_cfg.widget_id}`);
+        }
+      } else {
+        setTimeout(() => {
+          fc_send_tmp_fnc(fc_recordId, fc_recordType, fc_user_public_key, fc_user_secret_key, fc_chat_id);
+        }, 2000);
       }
-    }
-
-    if (fc_recordType === "seen") {
-      const fc_unseenCount = Number(window.fc_unseen_notifications) || 0;
-      window.fc_unseen_notifications = Math.max(fc_unseenCount - 1, 0);
-      fc_countNotification_fnc(fc_user_public_key, fc_user_secret_key);
-      const notif = document.getElementById(`fc-notification-${fc_recordId}`);
-      if (notif) {
-        notif.classList.remove(`fc-unread-${fc_cfg.widget_id}`);
-      }
-
-    }
-  }
-}
-    );
+    });
+  } catch (err) {
   } finally {
-    setTimeout(() => {
-      window[fc_lockKey] = false;
-    }, 1000);
+    setTimeout(() => { window[fc_lockKey] = false; }, 1000);
   }
 }
+
+
+document.addEventListener("visibilitychange", () => {
+  //if (window.fc_unread_messages.size === 0) return;
+  if (!document.hidden && window.fc_last_user_public && window.fc_last_user_secret) {
+    window.fc_unread_messages.forEach((_, chatId) => {
+      fc_try_auto_tmp_fnc(chatId, window.fc_last_user_public, window.fc_last_user_secret);
+    });
+  }
+});
+
+
+document.addEventListener("focusin", (event) => {
+  if (window.fc_unread_messages.size === 0) return;
+  const chatWin = event.target.closest("[id^='fc-chat-win-']");
+  if (chatWin && window.fc_last_user_public && window.fc_last_user_secret) {
+    const fc_chatId = chatWin.id.replace("fc-chat-win-", "");
+    if (window.fc_unread_messages.has(fc_chatId)) {
+      fc_try_auto_tmp_fnc(fc_chatId, window.fc_last_user_public, window.fc_last_user_secret);
+    }
+  }
+});
 
 
 function fc_try_auto_tmp_fnc(fc_chat_id, fc_user_public_key, fc_user_secret_key) {
+  if (window.fc_unread_messages.size === 0) return;
   if (window.fc_priorityLock) return;
-  if (!fc_cfg || !fc_cfg.widget_id) return;
+  if (!fc_cfg?.widget_id) return;
   if (!fc_chat_id || !window.fc_unread_messages.has(fc_chat_id)) return;
   if (!document.hasFocus()) return;
+
   const fc_unseenSet = window.fc_unread_messages.get(fc_chat_id);
   if (!fc_unseenSet || fc_unseenSet.size === 0) return;
 
   const chatWinEl = fc_qs_fnc(`#fc-chat-win-${fc_chat_id}`);
-
-  // Only send if window focused and chat visible
     if (!chatWinEl || !chatWinEl.contains(document.activeElement) || chatWinEl.classList.contains(`fc-hidden-${fc_cfg.widget_id}`)) return;
 
-    Array.from(fc_unseenSet).forEach(fc_messageId => {
-      const fc_lockKey = `fc_seen_lock_${fc_chat_id}_${fc_messageId}`;
-      if (!window[fc_lockKey]) {        
-        setTimeout(() => {
-          fc_send_tmp_fnc(fc_messageId, 'read', fc_user_public_key, fc_user_secret_key, fc_chat_id);
-      }, 600);
-      }
-    });
-  
+  // Process all unseen messages with staggered delay
+  let delay = 0;
+  for (const fc_messageId of fc_unseenSet) {
+    const fc_lockKey = `fc_seen_lock_${fc_chat_id}_${fc_messageId}`;
+    if (!window[fc_lockKey]) {
+      delay += 500; // stagger each send by 500ms
+      setTimeout(() => {
+        fc_send_tmp_fnc(fc_messageId, "read", fc_user_public_key, fc_user_secret_key, fc_chat_id);
+      }, delay);
+    }
+  }
 }
+
 
 function fc_add_unseen_message_fnc(fc_chat_id, fc_messageId) {
   if (!window.fc_unread_messages.has(fc_chat_id)) {
@@ -5308,10 +5381,10 @@ function fc_updateSelf_fnc(fc_self_info, fc_user_public_key) {
 
   // Update text content safely
   if (elements.nickname && fc_self_info.nickname) {
-    elements.nickname.textContent = fc_safeText_fnc(fc_self_info.nickname);
+    elements.nickname.textContent = fc_self_info.nickname;
   }
   if (elements.statusText && fc_self_info.status) {
-    elements.statusText.textContent = fc_safeText_fnc(fc_self_info.status);
+    elements.statusText.textContent = fc_self_info.status;
   }
 
   // Update status classes
